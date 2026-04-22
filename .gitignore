@@ -1,0 +1,19 @@
+# Go caches and test artifacts
+.gocache/
+coverage.out
+*.test
+
+# Local build outputs
+.out/
+bin/
+dist/
+/wazuh-runtime-java-normalizer
+
+# Local debug files
+/request.json
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
