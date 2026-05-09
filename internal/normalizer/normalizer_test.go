@@ -1,6 +1,8 @@
 package normalizer
 
 import (
+	"archive/zip"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -10,6 +12,36 @@ import (
 func testJarPath(t *testing.T, name string) string {
 	t.Helper()
 	return filepath.Clean(filepath.Join("..", "..", "..", "wazuh", "src", "wazuh_modules", "syscollector", "tests", "sysCollectorImp", "data", name))
+}
+
+func createManifestOnlyJar(t *testing.T, fileName string, manifest string) string {
+	t.Helper()
+	jarPath := filepath.Join(t.TempDir(), fileName)
+	file, err := os.Create(jarPath)
+	if err != nil {
+		t.Fatalf("create jar failed: %v", err)
+	}
+
+	writer := zip.NewWriter(file)
+	entry, err := writer.Create("META-INF/MANIFEST.MF")
+	if err != nil {
+		_ = writer.Close()
+		_ = file.Close()
+		t.Fatalf("create manifest entry failed: %v", err)
+	}
+	if _, err = entry.Write([]byte(manifest)); err != nil {
+		_ = writer.Close()
+		_ = file.Close()
+		t.Fatalf("write manifest failed: %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		_ = file.Close()
+		t.Fatalf("close zip writer failed: %v", err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatalf("close jar file failed: %v", err)
+	}
+	return jarPath
 }
 
 func TestNormalizeUsesPomPropertiesWhenAvailable(t *testing.T) {
@@ -58,6 +90,31 @@ func TestNormalizeFallsBackToManifest(t *testing.T) {
 		t.Fatalf("unexpected sha1: %s", component.SHA1)
 	}
 	if component.EvidenceSource != "manifest" || component.Confidence != "medium" {
+		t.Fatalf("unexpected evidence: %#v", component)
+	}
+}
+
+func TestNormalizePrefersFilenameArtifactWhenManifestOnlyProvidesDisplayName(t *testing.T) {
+	jarPath := createManifestOnlyJar(t, "tomcat-util-scan-8.5.82.jar", "Manifest-Version: 1.0\nImplementation-Title: Apache Tomcat\nImplementation-Version: 8.5.82\nImplementation-Vendor-Id: org.apache.tomcat\n")
+
+	response := New().Normalize(api.NormalizeRequest{
+		Candidates: []api.Candidate{{
+			RuntimePath:     jarPath,
+			DiscoverySource: "fd",
+		}},
+	})
+
+	if len(response.Components) != 1 {
+		t.Fatalf("expected 1 component, got %d", len(response.Components))
+	}
+	component := response.Components[0]
+	if component.GroupID != "org.apache.tomcat" || component.ArtifactID != "tomcat-util-scan" || component.Version != "8.5.82" {
+		t.Fatalf("unexpected component identity: %#v", component)
+	}
+	if component.PURL != "pkg:maven/org.apache.tomcat/tomcat-util-scan@8.5.82" {
+		t.Fatalf("unexpected purl: %s", component.PURL)
+	}
+	if component.EvidenceSource != "manifest+filename" || component.Confidence != "medium" {
 		t.Fatalf("unexpected evidence: %#v", component)
 	}
 }

@@ -26,14 +26,19 @@ const (
 var artifactVersionPattern = regexp.MustCompile(`^(.+)-([0-9][A-Za-z0-9._-]*)$`)
 
 type archiveMetadata struct {
-	groupID        string
-	artifactID     string
-	version        string
-	purl           string
-	sha1           string
-	evidenceSource string
-	confidence     string
-	packageType    string
+	groupID              string
+	artifactID           string
+	version              string
+	purl                 string
+	sha1                 string
+	evidenceSource       string
+	confidence           string
+	packageType          string
+	artifactFromManifest bool
+	versionFromManifest  bool
+	groupFromManifest    bool
+	artifactFromFilename bool
+	versionFromFilename  bool
 }
 
 type Service struct{}
@@ -120,7 +125,7 @@ func resolveArchiveMetadataFromFile(archivePath, componentPathHint string) archi
 	reader, err := zip.OpenReader(archivePath)
 	if err == nil {
 		defer reader.Close()
-		fillMetadataFromZip(&metadata, &reader.Reader)
+		fillMetadataFromZip(&metadata, &reader.Reader, componentPathHint)
 	}
 	completeMetadata(&metadata, componentPathHint)
 	return metadata
@@ -132,14 +137,14 @@ func resolveArchiveMetadataFromBytes(content []byte, componentPathHint string) a
 		metadata.sha1 = computeBytesSHA1(content)
 		reader, err := zip.NewReader(bytes.NewReader(content), int64(len(content)))
 		if err == nil {
-			fillMetadataFromZip(&metadata, reader)
+			fillMetadataFromZip(&metadata, reader, componentPathHint)
 		}
 	}
 	completeMetadata(&metadata, componentPathHint)
 	return metadata
 }
 
-func fillMetadataFromZip(metadata *archiveMetadata, reader *zip.Reader) {
+func fillMetadataFromZip(metadata *archiveMetadata, reader *zip.Reader, componentPathHint string) {
 	if metadata == nil || reader == nil {
 		return
 	}
@@ -157,29 +162,28 @@ func fillMetadataFromZip(metadata *archiveMetadata, reader *zip.Reader) {
 
 	if manifestFile := findEntry(reader, manifestEntryPath); manifestFile != nil {
 		manifest := parseManifest(readZipFileString(manifestFile))
-		if metadata.artifactID == "" {
-			metadata.artifactID = firstNonEmpty(
-				manifest["Implementation-Title"],
-				manifest["Bundle-Name"],
-				extractArtifactFromBundleSymbolicName(manifest["Bundle-SymbolicName"]),
-			)
+		manifestArtifact := chooseManifestArtifact(manifest, componentPathHint)
+		manifestVersion := firstNonEmpty(
+			sanitizeManifestValue(manifest["Implementation-Version"]),
+			sanitizeManifestValue(manifest["Bundle-Version"]),
+			sanitizeManifestValue(manifest["Specification-Version"]),
+		)
+		manifestGroup := firstCoordinateLike(
+			sanitizeManifestValue(manifest["Implementation-Vendor-Id"]),
+			extractGroupFromBundleSymbolicName(manifest["Bundle-SymbolicName"]),
+		)
+
+		if metadata.artifactID == "" && manifestArtifact != "" {
+			metadata.artifactID = manifestArtifact
+			metadata.artifactFromManifest = true
 		}
-		if metadata.version == "" {
-			metadata.version = firstNonEmpty(
-				manifest["Implementation-Version"],
-				manifest["Bundle-Version"],
-				manifest["Specification-Version"],
-			)
+		if metadata.version == "" && manifestVersion != "" {
+			metadata.version = manifestVersion
+			metadata.versionFromManifest = true
 		}
-		if metadata.groupID == "" {
-			metadata.groupID = firstNonEmpty(
-				manifest["Implementation-Vendor-Id"],
-				extractGroupFromBundleSymbolicName(manifest["Bundle-SymbolicName"]),
-			)
-		}
-		if metadata.evidenceSource == "" && (metadata.artifactID != "" || metadata.version != "") {
-			metadata.evidenceSource = "manifest"
-			metadata.confidence = "medium"
+		if metadata.groupID == "" && manifestGroup != "" {
+			metadata.groupID = manifestGroup
+			metadata.groupFromManifest = true
 		}
 	}
 }
@@ -190,15 +194,26 @@ func completeMetadata(metadata *archiveMetadata, componentPathHint string) {
 	}
 
 	artifactID, version := inferArtifactAndVersion(componentPathHint)
-	if metadata.artifactID == "" {
+	if metadata.artifactID == "" && artifactID != "" {
 		metadata.artifactID = artifactID
+		metadata.artifactFromFilename = true
 	}
-	if metadata.version == "" {
+	if metadata.version == "" && version != "" {
 		metadata.version = version
+		metadata.versionFromFilename = true
 	}
 	if metadata.evidenceSource == "" {
-		metadata.evidenceSource = "filename"
-		metadata.confidence = "low"
+		if metadata.artifactFromManifest || metadata.versionFromManifest || metadata.groupFromManifest {
+			if metadata.artifactFromFilename || metadata.versionFromFilename {
+				metadata.evidenceSource = "manifest+filename"
+			} else {
+				metadata.evidenceSource = "manifest"
+			}
+			metadata.confidence = "medium"
+		} else {
+			metadata.evidenceSource = "filename"
+			metadata.confidence = "low"
+		}
 	}
 	metadata.purl = buildMavenPURL(metadata.groupID, metadata.artifactID, metadata.version)
 	if metadata.purl == "" {
@@ -353,6 +368,87 @@ func mergeDiscoverySources(current, next string) string {
 	return strings.Join(merged, ",")
 }
 
+func sanitizeManifestValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.HasPrefix(trimmed, "%") {
+		return ""
+	}
+	return trimmed
+}
+
+func looksLikeCoordinateValue(value string) bool {
+	trimmed := sanitizeManifestValue(value)
+	if trimmed == "" || strings.ContainsAny(trimmed, " \t/\\:@") {
+		return false
+	}
+	for _, ch := range trimmed {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') {
+			continue
+		}
+		if ch != '.' && ch != '_' && ch != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeArtifactKey(value string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	if trimmed == "" {
+		return ""
+	}
+	var builder strings.Builder
+	builder.Grow(len(trimmed))
+	lastDash := false
+	for _, ch := range trimmed {
+		switch {
+		case (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'):
+			builder.WriteRune(ch)
+			lastDash = false
+		case ch == '.' || ch == '_' || ch == '-':
+			if !lastDash {
+				builder.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+func sameArtifactIdentity(left, right string) bool {
+	leftKey := normalizeArtifactKey(left)
+	rightKey := normalizeArtifactKey(right)
+	return leftKey != "" && leftKey == rightKey
+}
+
+func firstCoordinateLike(values ...string) string {
+	for _, value := range values {
+		if looksLikeCoordinateValue(value) {
+			return sanitizeManifestValue(value)
+		}
+	}
+	return ""
+}
+
+func chooseManifestArtifact(manifest map[string]string, componentPathHint string) string {
+	manifestArtifact := firstCoordinateLike(
+		manifest["Implementation-Title"],
+		manifest["Bundle-Name"],
+		manifest["Specification-Title"],
+	)
+	if manifestArtifact == "" {
+		return ""
+	}
+	filenameArtifact, _ := inferArtifactAndVersion(componentPathHint)
+	if filenameArtifact == "" {
+		return manifestArtifact
+	}
+	if sameArtifactIdentity(manifestArtifact, filenameArtifact) {
+		return filenameArtifact
+	}
+	return ""
+}
+
 func extractArtifactFromBundleSymbolicName(value string) string {
 	if value == "" {
 		return ""
@@ -366,6 +462,7 @@ func extractArtifactFromBundleSymbolicName(value string) string {
 }
 
 func extractGroupFromBundleSymbolicName(value string) string {
+	value = sanitizeManifestValue(value)
 	if value == "" {
 		return ""
 	}
